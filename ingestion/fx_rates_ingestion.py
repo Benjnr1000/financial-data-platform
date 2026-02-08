@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 import os
+from sqlalchemy.dialects.postgresql import insert
 
 # Load environment variables
 load_dotenv("config/.env")
@@ -52,12 +53,38 @@ for quote_currency, rate in rates.items():
 
 df = pd.DataFrame(records)
 
-# Load into raw table
-df.to_sql(
-    "raw_fx_rates",
-    engine,
-    if_exists="append",
-    index=False
+# -----------------------------
+# Data quality checks
+# -----------------------------
+if df["rate"].isnull().any():
+    raise ValueError("Null FX rate detected")
+
+if (df["rate"] <= 0).any():
+    raise ValueError("Invalid FX rate detected")
+
+# Remove duplicates just in case
+df.drop_duplicates(
+    subset=["base_currency", "quote_currency", "rate_date"],
+    inplace=True
 )
+
+# -----------------------------
+# Load into raw table
+# -----------------------------
+from sqlalchemy import Table, MetaData
+
+metadata = MetaData()
+raw_fx_rates = Table(
+    "raw_fx_rates",
+    metadata,
+    autoload_with=engine
+)
+
+with engine.begin() as conn:
+    stmt = insert(raw_fx_rates).values(df.to_dict(orient="records"))
+    stmt = stmt.on_conflict_do_nothing(
+        index_elements=["base_currency", "quote_currency", "rate_date"]
+    )
+    conn.execute(stmt)
 
 print(f"✅ FX rates ingested for {rate_date}")
