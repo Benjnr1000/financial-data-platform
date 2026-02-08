@@ -21,6 +21,21 @@ url = URL.create(
 
 engine = create_engine(url)
 
+from sqlalchemy import text
+from datetime import date
+
+with engine.connect() as conn:
+    result = conn.execute(
+        text("SELECT MAX(rate_date) FROM raw_fx_rates WHERE base_currency = 'USD'")
+    ).fetchone()
+
+latest_date = result[0]
+today = date.today()
+
+if latest_date == today:
+    print("ℹ️ FX rates already ingested for today. Skipping.")
+    exit()
+    
 # FX API (no auth)
 API_URL = "https://open.er-api.com/v6/latest/USD"
 
