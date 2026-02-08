@@ -1,3 +1,5 @@
+import sys
+import logging
 import requests
 import pandas as pd
 from sqlalchemy import create_engine
@@ -5,6 +7,14 @@ from sqlalchemy.engine import URL
 from dotenv import load_dotenv
 import os
 from sqlalchemy.dialects.postgresql import insert
+from datetime import date
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv("config/.env")
@@ -21,85 +31,90 @@ url = URL.create(
 
 engine = create_engine(url)
 
-from sqlalchemy import text
-from datetime import date
+try:
+    logger.info("FX ingestion pipeline started")
 
-with engine.connect() as conn:
-    result = conn.execute(
-        text("SELECT MAX(rate_date) FROM raw_fx_rates WHERE base_currency = 'USD'")
-    ).fetchone()
+    from sqlalchemy import text
 
-latest_date = result[0]
-today = date.today()
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT MAX(rate_date) FROM raw_fx_rates WHERE base_currency = 'USD'")
+        ).fetchone()
 
-if latest_date == today:
-    print("ℹ️ FX rates already ingested for today. Skipping.")
-    exit()
-    
-# FX API (no auth)
-API_URL = "https://open.er-api.com/v6/latest/USD"
+    latest_date = result[0]
+    today = date.today()
 
-params = {
-    "base": "USD"
-}
+    if latest_date == today:
+        logger.info("FX rates already ingested for today. Skipping pipeline.")
+        sys.exit(0)
+        
+    # FX API (no auth)
+    API_URL = "https://open.er-api.com/v6/latest/USD"
 
-response = requests.get(API_URL, params=params)
-response.raise_for_status()
+    response = requests.get(API_URL)
+    response.raise_for_status()
 
-data = response.json()
+    data = response.json()
 
-from datetime import date
+    logger.info("FX API call successful")
 
-if data.get("result") != "success":
-    raise Exception(f"API error: {data}")
+    if data.get("result") != "success":
+        raise Exception(f"API error: {data}")
 
-rates = data["rates"]
-rate_date = date.today().isoformat()
+    rates = data["rates"]
+    rate_date = date.today().isoformat()
 
-records = []
+    records = []
 
-for quote_currency, rate in rates.items():
-    records.append({
-        "base_currency": "USD",
-        "quote_currency": quote_currency,
-        "rate": rate,
-        "rate_date": rate_date
-    })
+    for quote_currency, rate in rates.items():
+        records.append({
+            "base_currency": "USD",
+            "quote_currency": quote_currency,
+            "rate": rate,
+            "rate_date": rate_date
+        })
 
-df = pd.DataFrame(records)
+    df = pd.DataFrame(records)
 
-# -----------------------------
-# Data quality checks
-# -----------------------------
-if df["rate"].isnull().any():
-    raise ValueError("Null FX rate detected")
+    # -----------------------------
+    # Data quality checks
+    # -----------------------------
+    if df["rate"].isnull().any():
+        raise ValueError("Null FX rate detected")
 
-if (df["rate"] <= 0).any():
-    raise ValueError("Invalid FX rate detected")
+    if (df["rate"] <= 0).any():
+        raise ValueError("Invalid FX rate detected")
 
-# Remove duplicates just in case
-df.drop_duplicates(
-    subset=["base_currency", "quote_currency", "rate_date"],
-    inplace=True
-)
-
-# -----------------------------
-# Load into raw table
-# -----------------------------
-from sqlalchemy import Table, MetaData
-
-metadata = MetaData()
-raw_fx_rates = Table(
-    "raw_fx_rates",
-    metadata,
-    autoload_with=engine
-)
-
-with engine.begin() as conn:
-    stmt = insert(raw_fx_rates).values(df.to_dict(orient="records"))
-    stmt = stmt.on_conflict_do_nothing(
-        index_elements=["base_currency", "quote_currency", "rate_date"]
+    # Remove duplicates just in case
+    df.drop_duplicates(
+        subset=["base_currency", "quote_currency", "rate_date"],
+        inplace=True
     )
-    conn.execute(stmt)
 
-print(f"✅ FX rates ingested for {rate_date}")
+    logger.info(f"Prepared {len(df)} FX rate records for ingestion")
+
+    # -----------------------------
+    # Load into raw table
+    # -----------------------------
+    from sqlalchemy import Table, MetaData
+
+    metadata = MetaData()
+    raw_fx_rates = Table(
+        "raw_fx_rates",
+        metadata,
+        autoload_with=engine
+    )
+
+    with engine.begin() as conn:
+        stmt = insert(raw_fx_rates).values(df.to_dict(orient="records"))
+        stmt = stmt.on_conflict_do_nothing(
+            index_elements=["base_currency", "quote_currency", "rate_date"]
+        )
+        conn.execute(stmt)
+
+    logger.info(f"FX rates ingested for {rate_date}")
+    logger.info("FX rates ingestion completed successfully")
+
+except Exception as e:
+    logger.exception("FX ingestion pipeline failed")
+    raise
